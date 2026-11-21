@@ -1,120 +1,169 @@
-# Methodology — Week-One Rarity Forecaster
+# Methodology — Week-One Rarity Forecaster R2
 
 ## What the program does
 
-For each of the 55 GTA VI trophies it forecasts the percent of Exophase-tracked
-players who will have earned it at the case's target, as five quantiles
-(0.05 / 0.25 / 0.5 / 0.75 / 0.95). The output is `<id>.out`:
-`{"trophies":[{"id":n,"q":[q05,q25,q50,q75,q95]}, ...]}`.
+For each of the 55 Grand Theft Auto VI trophies (PlayStation 5) it forecasts the percent
+of the players Exophase tracks for the game who will have earned the trophy at the case's
+target, as five quantiles (0.05 / 0.25 / 0.5 / 0.75 / 0.95). The input is the house's
+recording of Exophase's public trophy page: a list of reads, each with a timestamp, the
+number of players tracked, the total trophies earned, and the per-trophy rates. The
+program reads the case file and nothing else: no network, no clock, no randomness.
 
 ## The model
 
-An Exophase rarity is a ratio: `r = 100 * E / N`, earners over tracked players.
-Both sides move over the horizon, so the forecast models both:
+An Exophase rarity is a ratio, earners / tracked players, and both sides move. Per trophy
+the forecast is
 
-```
-E_T = E_last * G + m * (N_T - N_last)
-r_T = 100 * E_T / N_T
-```
+    E_T = E_last · G + m · (N_T − N_last),        r_T = 100 · E_T / N_T
 
-- `E_last`, `N_last` — earners and tracked players in the last read of the case.
-- `N_T` — tracked players at the target, projected from the history as a scenario
-  grid (not a point). Two regimes:
-  - *Identified growth* (log-range of tracked players >= 0.7): log-linear OLS fit
-    of `ln N` on time, projected to the target, centre capped at 300x the last
-    read; five scenarios at z = -1.5, -0.75, 0, 0.75, 1.5 with spread
-    `sigma_N = 0.35 + 0.30 * sqrt(horizon_days)`.
-  - *Flat history* (the practice cases): no trend exists to fit. Exophase
-    refreshes a game's counts on its own schedule; the program models refreshes
-    as Poisson with one refresh per 4.5 hours, each multiplying the tracked
-    population by 3x (k = 0..6 scenarios, weights renormalised).
-- `m` — the marginal earn rate of newly tracked players. Fitted per trophy by
-  OLS regression of earners on tracked players over the history (the slope is
-  the joiners' earn rate), shrunk toward the kind prior with weight
-  `R / (R + 1)`, `R` = log-range of tracked players. Flat history gives weight
-  0: pure prior.
-- `G = 1 + g_kind * horizon_days`, capped at 2.5 — old-cohort earning over the
-  horizon (early-story trophies are earned fast by players already tracked;
-  the platinum / 100% barely move).
-- The kind prior's marginal rate is tenure-scaled: joiners arrive uniformly
-  over the horizon, so the average joiner has half the horizon to play:
-  `s = S * (1 - exp(-(horizon_days / 2) / tau))`. One exception, driven by the
-  data itself: a trophy already held by >= 99% of tracked players gets
-  `s = 0.98` — "Complete Gone Fishing" sat at 100% before and after the
-  launch-night refresh, so its joiner rate is ~1, not the tenure curve's value.
-- Quantiles come from the scenario mixture: each scenario contributes a
-  logit-normal with spread 0.30, and the five levels are read off the mixture
-  CDF on a fixed 2401-point logit grid. As `N_T` grows large, `r_T` converges
-  to `m`, so a mis-projected population barely moves trophies whose marginal
-  rate the history identifies.
+where E_last and N_last are the last read's earners and tracked players, G = 1 + r·horizon
+(capped at 2.5) is the old cohort's growth, m is the marginal rate at which newly tracked
+players hold the trophy, r is the old cohort's earning rate per day, and N_T is the
+tracked population at the target. As N_T grows large the rate converges to m, so a
+mis-projected N_T barely moves trophies whose marginal rate the history identifies.
 
-## Kind priors (all estimated — see below)
+### Tracked population at the target (N_T)
 
-| Kind | S (week-one steady state) | tau (days) | g (/day) |
+Two branches, chosen by the log-range of the tracked population in the history:
+
+- **Growth branch** (log-range ≥ 0.7): a recency-weighted log-linear trend of log N on
+  time (weights decay with a 24 h half-life, so recent growth dominates — launch-week
+  inflow decays), projected to the target and capped at 300× the last read. Five
+  scenarios on a z-grid (−1.5, −0.75, 0, 0.75, 1.5) with σ_N = 0.35 + 0.3·√days.
+- **Flat branch** (log-range < 0.7): no trend can be fitted, so N_T comes from a refresh
+  process. Refreshes recur on a renewal schedule with a lognormal cadence (median 4.5 h,
+  σ 0.45), anchored at the last observed refresh (the last read where the tracked
+  population jumped). When no jump was ever observed, the last refresh time is unknown
+  — it predates the first read — so the staleness is integrated over one cadence back
+  from the first read (five points, equal weight). Each refresh multiplies the tracked
+  population by a lognormal size (σ 0.55) whose median scales with staleness,
+  1 + staleness_hours (clamped to 1.5–10×): the longer the page sits stale, the bigger
+  the backlog of unsynced players the next refresh picks up.
+
+### Marginal rate (m) and old-cohort earning (r)
+
+At each refresh the page jumps, and the jump identifies both quantities:
+
+    ΔE = m·ΔN + r·E_prev·Δt
+
+(joiners' holdings plus the old cohort's earning since the last refresh). R2 estimates
+them in two passes over the jump intervals — consecutive reads where the tracked
+population grew; flat stretches contribute nothing, because the page is frozen between
+refreshes and a flat stretch shows no earning at all:
+
+1. **m**: per jump, m_j = (ΔE − g_prior·E_prev·Δt) / ΔN (prior old-cohort earning
+   subtracted), clamped to [0, 1], averaged with weights ΔN·recency. Shrunk toward the
+   kind prior with weight totalJumpN / (totalJumpN + 2000 players).
+2. **r**: per jump, r_j = (ΔE − m·ΔN) / (E_prev·Δt), clamped to [0, 2] per day, averaged
+   with weights E_prev·Δt·recency (intervals with no prior earners carry no information
+   about r). Shrunk toward the kind prior g with weight totalEarnerDays /
+   (totalEarnerDays + 500 earner-days).
+
+With no jumps both stay at their kind priors.
+
+### Kind priors
+
+Trophies are classified from their official name and description in the case file
+(chapter trophies 1–4, finale, 100% completion/platinum, strands, grinds, collectibles,
+skill tests, one-off events, vague/secret). Each kind has a steady-state week-one earn
+rate S, a time scale tau (days to half of S), and an old-cohort growth rate g per day:
+
+| kind | S | tau (days) | g (/day) |
 |---|---|---|---|
-| tutorial (Gone Fishing) | 0.97 | 0.1 | 0 |
-| chapter 1 / 2 / 3 / 4 | 0.32 / 0.22 / 0.15 / 0.10 | 1.2 / 1.8 / 2.4 / 3.0 | 0.25 / 0.20 / 0.15 / 0.12 |
-| finale (final mission, gold) | 0.05 | 4.0 | 0.08 |
-| story (named mission) | 0.12 | 2.0 | 0.15 |
-| strand (final mission for X) | 0.05 | 3.0 | 0.10 |
-| grind (counts: 250 stunts, 20 races, …) | 0.03, scaled down with the count | 5.0 | 0.05 |
+| tutorial | 0.97 | 0.1 | 0 |
+| chapter1 | 0.32 | 1.2 | 0.25 |
+| chapter2 | 0.22 | 1.8 | 0.20 |
+| chapter3 | 0.15 | 2.4 | 0.15 |
+| chapter4 | 0.10 | 3.0 | 0.12 |
+| finale | 0.05 | 4.0 | 0.08 |
+| story | 0.12 | 2.0 | 0.15 |
+| strand | 0.05 | 3.0 | 0.10 |
+| grind | 0.03 | 5.0 | 0.05 |
 | collectible | 0.02 | 5.0 | 0.03 |
-| skill (gold medals, races at every location) | 0.04 | 3.5 | 0.08 |
-| event (one-off feats) | 0.08 | 2.0 | 0.10 |
-| completionist (platinum / 100%) | 0.002 | 10 | 0.02 |
-| vague (ambiguous secret trophies) | 0.03 | 3.0 | 0.08 |
+| skill | 0.04 | 3.5 | 0.08 |
+| event | 0.08 | 2.0 | 0.10 |
+| completionist | 0.002 | 10 | 0.02 |
+| vague | 0.03 | 3.0 | 0.08 |
 
-Kinds are classified at run time from the trophy's official name, description
-and tier in the case file — no trophy list is hardcoded. The program therefore
-works unchanged on the final case, whose 55 trophies are the same list.
+Grinds scale S down with the count: S·√(30 / (30 + count)). A trophy every tracked
+player already holds (last rate ≥ 99%) gets m = 0.98 regardless of kind — Gone Fishing
+sat at 100% before and after the launch-night refresh.
+
+The prior marginal rate follows a sigmoid in joiner tenure:
+
+    m_prior = S · (t/tau)² / (1 + (t/tau)²)
+
+where t is the joiner tenure: half the time from release to target, floored at half the
+horizon and capped at the horizon. The sigmoid is ~quadratic at short tenures — a player
+90 minutes into the game has finished nothing story-shaped yet — and saturates at S.
+
+### Quantiles
+
+Each N_T scenario gives a scenario rate and hence a logit centre μ. The forecast is the
+scenario mixture of logit-normals (within-scenario spread σ = 0.25) evaluated on a fixed
+2,401-point logit grid; the five quantiles are read off the mixture CDF and rounded to 4
+decimals, then forced non-decreasing. A trophy never observed in the history falls back
+to the kind prior alone, centred on the steady state with spread 0.8.
+
+## What R2 changes from R1
+
+R1 (loss 0.897 on practice) modelled refreshes as a memoryless Poisson process restarted
+at the checkpoint, fitted m by a levels OLS of earners on players-tracked, used a pure
+prior for old-cohort growth, and used a (1 − exp(−t/tau)) tenure curve with tenure =
+horizon/2. R2 changes four things:
+
+1. **Staleness-aware refresh timing.** R1 put ~72% of the mass on "no refresh" for the
+   practice cases, leaving the median near the last rate. R2's renewal process anchors
+   refreshes at the last observed refresh and integrates the unknown last-refresh time,
+   so a page stale for hours expects its refresh inside the horizon.
+2. **Jump-based m.** A levels OLS is dominated by the single largest (earliest, most
+   hardcore) jump; the jump estimator tracks the marginal joiner at the target and is
+   recency-weighted, since the marginal joiner gets more casual over launch week.
+3. **Fitted r.** The jump residuals identify old-cohort earning per trophy; R2 fits it
+   instead of trusting the prior alone.
+4. **Delayed sigmoid tenure from launch.** R1's linear-at-small-t curve put the marginal
+   rate of early-story trophies near 1.6% for a 90-minute horizon — over 50× the joiner
+   rate the launch-night refresh actually showed (~0.03 trophies per joiner outside the
+   tutorial). The sigmoid keeps short-tenure joiners near zero on story trophies.
+
+## Validation
+
+**Practice cases** (p00/p01). The true practice answers are the 04:30 refresh page
+(3,868 players, 4,276 trophies earned), which is no longer fetchable; validation scores
+the forecast against a range of plausible answers consistent with the known refresh
+totals (pure dilution; the 103 extra non-tutorial earns spread ∝ old earners, ∝
+√earners, or concentrated in the top 5 early trophies). R2 scores 0.18–0.27 across the
+range (mean ~0.20), against R1's 0.897 and the house persistence baseline's ~1.51. The
+model's median total (4,265 trophies earned at the refresh) matches the known total
+(4,276) within 0.3%.
+
+**Synthetic final-like cases.** Three generated cases with known ground truth (2.5 days
+of step-function history, saturating player growth to ~500k, marginal joiners more
+casual than the tracked population): R2 scores 0.13–0.15, against 0.29–0.33 for
+persistence and 1.70–1.73 for dilution alone.
+
+**Format and budget.** Output is 55 rows, five non-decreasing quantiles each, ~2.8 KB
+(limit 65,536 bytes). Runtime is 0.3–1.1 s per case (limit 8 s). Two runs on the same
+input write byte-identical output (no clock, no randomness, no network).
 
 ## Confirmed vs estimated
 
-**CONFIRMED** (from the competition kit and the case files themselves):
+**Confirmed** (from the kit's competition.yaml and the case files themselves): the 55
+trophies, their tiers, names and descriptions; the launch-night reads (638 players, rates
+flat from 23:48, then a refresh to 3,868 players with every rate but the 100% one
+falling); the refresh totals (943 → 4,276 trophies earned); the scoring rule (pinball
+loss on the logit scale, five quantiles); the 8-second per-case budget and the 65,536-byte
+output cap.
 
-- The 55 trophies, their tiers (1 platinum, 2 gold, 6 silver, 46 bronze), names
-  and descriptions — the case file, cut from Exophase's public trophy page
-  (`https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/`).
-- The launch-night reads: 638 players tracked, every rate unchanged from the
-  first probe (2026-11-18 23:50Z) through the 04:00Z read, then a refresh
-  between 04:00Z and 04:30Z to 3,868 players and 4,276 trophies earned, with
-  every rate but the one at 100% falling (kit's `competition.yaml`).
-- The scoring rule: pinball loss on the logit scale over five quantiles,
-  rates clamped to [0.01, 99.99] before the logit; 8,000 ms per case, 1 CPU,
-  1,024 MB.
+**Estimated** (reasoned, not official): every behavioural prior — the kind table, the
+refresh cadence (~4.5 h) and size, the spreads, the shrinkage strengths. The kind priors
+are reasoned from GTA V / GTA Online lifetime rarity curves and launch-week play
+patterns; no official GTA VI numbers exist yet, and none are claimed. The refresh
+cadence is inferred from the single observed launch-night gap (flat from 23:48, refreshed
+by 04:30) plus the kit's "hours apart" note.
 
-**ESTIMATED** (reasoned, not official — no official GTA VI data exists yet):
+## Sources
 
-- The kind priors `S / tau / g`. Basis: GTA V / GTA Online lifetime rarity
-  curves (early story trophies reach 60–80% lifetime, late story 30–50%,
-  100% completion ~1–2%, long grinds and collectible sets 2–10% lifetime),
-  discounted hard for week one: launch-week players average a few days of
-  play, so week-one rates sit far below lifetime rates, and story trophies
-  early in the game are earned far faster than late-game or grind trophies.
-- The refresh cadence (~4.5 h) and size (~3x central). Basis: the single
-  observed gap (flat 23:50Z→04:00Z, refreshed by 04:30Z) and the one observed
-  jump (638 → 3,868 players, ~6x). The 3x centre is deliberately below the
-  single 6x observation: a first-refresh backlog is expected to be larger
-  than a typical refresh.
-- The spreads (0.30 within-scenario, `sigma_N` for the population projection).
-  Chosen so the 90% band covers the refresh-vs-no-refresh ambiguity on a flat
-  history and the extrapolation error on a 4.5-day horizon.
-
-No "official" GTA VI numbers are claimed anywhere in the entry. Nothing is
-copied from another guide or entry: the trophy data comes from the case file,
-and every line of code and prose in this repository was written for this entry.
-
-## Validation done locally
-
-- Practice cases p00/p01: run in ~0.3 s each (cap 8 s), byte-identical across
-  two runs, 55 valid rows each, output 2,792 bytes (cap 65,536).
-- Against a pure-dilution proxy answer for p00 (earners unchanged, players
-  638 → 3,868, tutorial stays 100%): pinball loss 1.06 vs the house
-  persistence baseline's 1.69 (typical miss 0.61 pp vs 0.73 pp). The proxy is
-  an extreme (new joiners earn nothing beyond the tutorial); the real answer
-  will sit between pure dilution and persistence, and the model's band covers
-  both.
-- A synthetic final-like case (30 reads, players 638 → ~42,000 over 2.5 days,
-  4.5-day horizon): the fitted branch engages, chapter 1 forecasts ~44%
-  (from 47.5% last, converging toward its fitted joiner rate), the platinum
-  ~0.09%, the tutorial ~98% — the shape the model is designed to produce.
+- The competition kit's `competition.yaml` (rules, practice and final case definitions,
+  the launch-night refresh narrative) and the case files `p00.in` / `p01.in`.
+- The `README.md` of this repository for how to run the program.
